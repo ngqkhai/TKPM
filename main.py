@@ -1,70 +1,36 @@
-import requests
-from preprocess_input import preprocess_query
-from categorize_topic import classify_topic_gemini
-import time
-
-# Wikipedia API setup
-USER_AGENT = "ScienceArticleScraperBot/1.0 (https://github.com/ngqkhai)"
-HEADERS = {"User-Agent": USER_AGENT}
-
-def search_wikipedia(query):
+from data_collection.wiki_search_pipeline import fetch_best_wikipedia_page
+def main():
     """
-    Searches Wikipedia for the most relevant page title based on the query.
-    Returns the best match page title.
+    Main entry point for the Wikipedia search application.
+    Demonstrates the functionality with example queries.
     """
-    url = "https://en.wikipedia.org/w/api.php"
-    params = {
-        "action": "query",
-        "format": "json",
-        "list": "search",
-        "srsearch": query
-    }
+    test_queries = [
+        "Who discovered gravity?",
+        "Why do we dream?",
+        "How does photosynthesis work?",
+        "What is artificial intelligence?",
+        "Why is the ocean salty?",
+    ]
 
-    response = requests.get(url, headers=HEADERS, params=params)
-    data = response.json()
+    for query in test_queries:
+        print("\n" + "="*50)
+        print(f"USER QUERY: {query}")
+        print("="*50)
+        
+        result = fetch_best_wikipedia_page(query)
+        
+        if "error" in result:
+            print(f"ERROR: {result['error']}")
+        else:
+            print(f"TITLE: {result['title']}")
+            print(f"RELEVANCE: {result['score']:.2f}")
+            print("\nCONTENT PREVIEW:")
+            print("-"*50)
+            # Show first 300 characters of content
+            preview = result['content'][:300] + "..." if len(result['content']) > 300 else result['content']
+            print(preview)
+            print("-"*50)
 
-    if "query" in data and "search" in data["query"]:
-        return data["query"]["search"][0]["title"]  # Return the top search result
 
-    return None
-
-def get_wikipedia_content(title):
-    """
-    Retrieves the full content of a Wikipedia page by its title.
-    """
-    url = "https://en.wikipedia.org/w/api.php"
-    params = {
-        "action": "query",
-        "format": "json",
-        "prop": "extracts",
-        "explaintext": True,
-        "titles": title
-    }
-
-    response = requests.get(url, headers=HEADERS, params=params)
-    data = response.json()
-
-    pages = data.get("query", {}).get("pages", {})
-    page_content = next(iter(pages.values()), {}).get("extract", "")
-
-    return page_content if page_content else "Content not found."
-
-# Main function to get Wikipedia content for a query
-def fetch_scientific_content(query):
-    # cleaned_query = preprocess_query(query)
-    cleaned_query = query
-    print(cleaned_query)
-    detected_topic = classify_topic_gemini(cleaned_query)
-
-    wikipedia_title = search_wikipedia(cleaned_query)
-    if wikipedia_title:
-        content = get_wikipedia_content(wikipedia_title)
-        return {"title": wikipedia_title, "content": content}
-
-    return {"error": "No relevant Wikipedia page found."}
-
-# Example usage
-query = "What is quantum entanglement?"
-data = fetch_scientific_content(query)
-print(f"Title: {data.get('title', 'Not found')}\n")
-print(data.get("content", "No content retrieved."))
+if __name__ == "__main__":
+    main()

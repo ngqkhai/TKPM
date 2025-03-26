@@ -1,187 +1,303 @@
-from abc import ABC, abstractmethod
 import requests
-import xml.etree.ElementTree as ET
-from datetime import datetime
 import os
+import time
 from dotenv import load_dotenv
+import google.generativeai as genai
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Load environment variables
 load_dotenv()
-NATURE_API_KEY = os.getenv("NATURE_API_KEY")
-# -----------------------------
-# Abstract Base Class
-# -----------------------------
-class DataRetriever(ABC):
-    @abstractmethod
-    def search(self, query: str, max_results: int = 10):
-        """Search for data using a query string."""
-        pass
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY_EX")
+GEMINI_MODEL = "gemini-2.0-flash-lite"
 
-# -----------------------------
-# PubMed Retriever using NCBI E-utilities
-# -----------------------------
-class PubMedRetriever(DataRetriever):
-    BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+# Configure Gemini AI
+genai.configure(api_key=GEMINI_API_KEY)
 
-    def search(self, query: str, max_results: int = 10):
-        """
-        Optimized search for PubMed:
-        - Uses field-specific search (Title/Abstract)
-        - Filters for journal articles
-        - Limits to recent publications (last 5 years)
-        - Sorts by relevance via API parameters
-        """
-        formatted_query = f"({query})[Title/Abstract] AND (journal article[Publication Type])"
-        params = {
-            "db": "pubmed",
-            "term": formatted_query,
-            "retmode": "json",
-            "retmax": max_results,
-            "sort": "relevance",  # API-driven relevance sorting
-            "datetype": "pdat",
-            "reldate": 365 * 5  # Limit to the last 5 years
-        }
+# Wikipedia API setup
+USER_AGENT = "ScienceScraperBot/1.0 (https://github.com/ngqkhai)"
+HEADERS = {"User-Agent": USER_AGENT}
 
+
+### --- Step 1: AI-Optimized Wikipedia Query Refinement --- ###
+def refine_query_with_gemini(query, max_retries=3):
+    """
+    Uses Gemini AI to convert a user question into a concise, Wikipedia-friendly search phrase.
+    The prompt is designed to work across diverse query types and knowledge domains.
+    If a 429 quota error occurs, the function waits 60 seconds and retries.
+    Return only the refined search phrase as plain text.
+    """
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    prompt = f"""
+Transform this user question into the optimal Wikipedia search term:
+
+"{query}"
+
+Rules to follow:
+1. For "what is" questions: Use the subject noun phrase (e.g., "What is quantum computing?" → "Quantum computing")
+2. For "who" questions: Focus on the achievement or concept (e.g., "Who discovered gravity?" → "Discovery of gravity")
+3. For "why/how" questions: Extract the core phenomenon (e.g., "Why is the sky blue?" → "Sky blue phenomenon")
+4. For cause/effect questions: Focus on the effect (e.g., "What causes earthquakes?" → "Earthquakes")
+5. Follow Wikipedia's naming pattern – typically concise noun phrases.
+6. Limit to 1-4 words unless additional context is necessary.
+7. Prefer technical terms over colloquial expressions.
+8. Do NOT include names, dates, or direct answers.
+
+Output ONLY the search term as plain text.
+"""
+    attempt = 0
+    while attempt <= max_retries:
         try:
-            response = requests.get(self.BASE_URL, params=params)
-            response.raise_for_status()
-            data = response.json()
-            id_list = data.get("esearchresult", {}).get("idlist", [])
-            return id_list
-        except requests.RequestException as e:
-            print(f"Error retrieving PubMed data: {e}")
-            return []
+            response = model.generate_content(prompt)
+            refined = response.text.strip()
+            logging.info(f"Refined query: '{refined}'")
+            return refined
+        except Exception as e:
+            error_msg = str(e)
+            if "429" in error_msg:
+                logging.warning(f"Gemini quota exceeded. Sleeping 60s before retrying... (Attempt {attempt+1}/{max_retries})")
+                time.sleep(60)
+                attempt += 1
+                continue
+            else:
+                logging.error(f"Gemini error during query refinement: {e}")
+                break
+    return query  # Fallback to original query if Gemini repeatedly fails
 
-# -----------------------------
-# arXiv Retriever using its API (returns Atom XML)
-# -----------------------------
-class ArxivRetriever(DataRetriever):
-    BASE_URL = "http://export.arxiv.org/api/query"
 
-    def search(self, query: str, max_results: int = 10):
-        """
-        Optimized search for arXiv:
-        - Searches title and abstract using exact phrase matching
-        - Constructs a query using Boolean operators for higher relevance
-        - Sorts results by publication date (latest first)
-        """
-        # Using field-specific query syntax to target title and abstract
-        formatted_query = f'ti:"{query}" OR abs:"{query}"'
-        params = {
-            "search_query": formatted_query,
-            "start": 0,
-            "max_results": max_results
-        }
-
-        try:
-            response = requests.get(self.BASE_URL, params=params)
-            response.raise_for_status()
-            root = ET.fromstring(response.content)
-
-            results = []
-            ns = {'atom': 'http://www.w3.org/2005/Atom'}
-            for entry in root.findall("atom:entry", ns):
-                title = entry.find("atom:title", ns).text.strip()
-                abstract = entry.find("atom:summary", ns).text.strip()
-                published = entry.find("atom:published", ns).text.strip()
-
-                results.append({
-                    "title": title,
-                    "abstract": abstract,
-                    "published": published
-                })
-
-            # Sort results by publication date (assuming ISO date format, latest first)
-            results = sorted(results, key=lambda x: x["published"], reverse=True)
-            return results
-        except requests.RequestException as e:
-            print(f"Error retrieving arXiv data: {e}")
-            return []
-        except ET.ParseError as pe:
-            print(f"Error parsing arXiv XML: {pe}")
-            return []
-
-# -----------------------------
-# Nature Retriever using Springer API
-# -----------------------------
-class NatureRetriever(DataRetriever):
-    BASE_URL = "https://api.springernature.com/openaccess/json"
-    API_KEY = NATURE_API_KEY  # Replace with your actual API key
-
-    def search(self, query: str, max_results: int = 10):
-        """
-        Optimized search for Nature/Springer Open Access:
-        - Uses Boolean search to target title and abstract fields
-        - Requests results sorted by publication date from the API
-        - Post-processes to filter and sort if needed
-        """
-        params = {
-            "api_key": self.API_KEY,
-            "q": f"title:{query} OR abstract:{query}",
-            "p": max_results,
-            "s": "date"  # Let the API sort by publication date
-        }
-
-        try:
-            response = requests.get(self.BASE_URL, params=params)
-            response.raise_for_status()
-            data = response.json()
-            records = data.get("records", [])
-
-            results = []
-            for record in records:
-                title = record.get("title")
-                abstract = record.get("abstract")
-                publication_date = record.get("publicationDate")
-                journalTitle = record.get("journalTitle")
-                doi = record.get("doi")
-
-                results.append({
-                    "title": title,
-                    "abstract": abstract,
-                    "publicationDate": publication_date,
-                    "journalTitle": journalTitle,
-                    "doi": doi
-                })
-
-            # Sort by publication date (latest first)
-            results = sorted(results, key=lambda x: x["publicationDate"], reverse=True)
-            return results
-        except requests.RequestException as e:
-            print(f"Error retrieving Nature data: {e}")
-            return []
-        except ValueError as ve:
-            print(f"Error parsing Nature JSON: {ve}")
-            return []
-
-# -----------------------------
-# Main Driver Function to Test Retrievers
-# -----------------------------
-def main():
-    query = "CRISPR gene editing"
+### --- Step 2: Wikipedia Search (Standard Search API) --- ###
+def search_wikipedia(query, max_retries=2):
+    """
+    Searches Wikipedia for relevant page titles using the standard search API.
+    Returns a list of up to 5 article titles.
+    Includes retry logic for better resilience.
+    """
+    url = "https://en.wikipedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "format": "json",
+        "list": "search",
+        "srsearch": query,
+        "srlimit": 5,
+    }
     
-    # PubMed
-    pubmed = PubMedRetriever()
-    pubmed_ids = pubmed.search(query)
-    print("PubMed IDs:")
-    for pid in pubmed_ids:
-        print(f" - {pid}")
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.get(url, headers=HEADERS, params=params, timeout=10)
+            logging.info(f"Search URL: {response.url}")
+            if response.status_code == 200:
+                search_results = response.json().get("query", {}).get("search", [])
+                return [res["title"] for res in search_results]
+            elif response.status_code == 429:
+                wait_time = 2 * (attempt + 1)
+                logging.warning(f"Wikipedia search rate limited. Waiting {wait_time}s before retry...")
+                time.sleep(wait_time)
+                continue
+            logging.error(f"Wikipedia search failed with status: {response.status_code}")
+            return []
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries:
+                logging.warning(f"Request error: {e}. Retrying...")
+                continue
+            logging.error(f"Wikipedia search request error: {e}")
+            return []
+    
+    return []
 
-    # arXiv
-    arxiv = ArxivRetriever()
-    arxiv_results = arxiv.search(query)
-    print("\narXiv Titles:")
-    for result in arxiv_results:
-        print(f" - {result['title']} (Published: {result['published']})")
 
-    # Nature/Springer
-    # nature = NatureRetriever()
-    # nature_results = nature.search(query, max_results=5)
-    # print("\nNature/Springer Open Access Articles:")
-    # for idx, record in enumerate(nature_results, 1):
-    #     print(f"{idx}. Title: {record.get('title')}")
-    #     print(f"   DOI: {record.get('doi')}")
-    #     print(f"   Abstract: {record.get('abstract')}")
-    #     print(f"   Publication Date: {record.get('publicationDate')}")
-    #     print(f"   Journal Title: {record.get('journalTitle')}\n")
+### --- Step 3: Fetch Wikipedia Content + Categories (Disambiguation Check) --- ###
+def get_wikipedia_content(title, max_retries=2):
+    """
+    Retrieves the full content and categories for a given Wikipedia article.
+    Filters out disambiguation pages.
+    Returns (title, content) if valid, else (None, None).
+    Includes retry logic for better resilience.
+    """
+    url = "https://en.wikipedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "format": "json",
+        "prop": "extracts|categories",
+        "explaintext": True,
+        "titles": title
+    }
+    
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.get(url, headers=HEADERS, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json().get("query", {}).get("pages", {})
+                for page in data.values():
+                    extract = page.get("extract", "")
+                    categories = [cat["title"].lower() for cat in page.get("categories", [])]
+                    if any("disambiguation" in cat for cat in categories):
+                        return None, None
+                    return title, extract
+                return None, None
+            elif response.status_code == 429:
+                wait_time = 2 * (attempt + 1)
+                logging.warning(f"Wikipedia content fetch rate limited. Waiting {wait_time}s before retry...")
+                time.sleep(wait_time)
+                continue
+            logging.error(f"Wikipedia content fetch failed with status: {response.status_code}")
+            return None, None
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries:
+                continue
+            logging.error(f"Wikipedia content request error: {e}")
+            return None, None
+    
+    return None, None
 
+
+### --- Step 4: AI Validation (Gemini) for Best Match --- ###
+def is_relevant_page_gemini(query, wiki_title, wiki_summary, max_retries=3):
+    """
+    Uses Gemini AI to assess relevance between the user query and Wikipedia content.
+    Returns a confidence score between 0.0 and 1.0.
+    If a 429 error occurs, waits 60 seconds and retries.
+    """
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    summary_preview = wiki_summary[:300] + ("..." if len(wiki_summary) > 300 else "")
+    prompt = f"""
+You are a relevance scoring algorithm that evaluates how well a Wikipedia article answers a user's question.
+
+USER QUESTION: "{query}"
+WIKIPEDIA ARTICLE TITLE: "{wiki_title}"
+WIKIPEDIA ARTICLE EXCERPT: "{summary_preview}"
+
+Score how directly this article answers the user's question:
+- 1.0: Perfectly answers the question.
+- 0.8-0.9: Highly relevant.
+- 0.6-0.7: Partially addresses the question.
+- 0.4-0.5: Minimally relevant.
+- 0.0: Completely irrelevant.
+
+Output ONLY a single decimal score between 0.0 and 1.0.
+"""
+    attempt = 0
+    while attempt <= max_retries:
+        try:
+            response = model.generate_content(prompt)
+            score_text = response.text.strip()
+            score_text = ''.join(c for c in score_text if c.isdigit() or c == '.')
+            score = float(score_text)
+            score = max(0.0, min(score, 1.0))
+            return score
+        except Exception as e:
+            error_msg = str(e)
+            if "429" in error_msg:
+                logging.warning(f"Gemini relevance quota exceeded. Sleeping 60s before retrying... (Attempt {attempt+1}/{max_retries})")
+                time.sleep(60)
+                attempt += 1
+                continue
+            logging.error(f"Gemini relevance scoring error: {e}")
+            break
+    return 0.0
+
+
+### --- Step 5: Fetch Best Wikipedia Page --- ###
+def fetch_best_wikipedia_page(query):
+    """
+    Enhanced pipeline for finding the most relevant Wikipedia page.
+    Combines:
+      1. Query refinement using Gemini.
+      2. Wikipedia search using the standard search API.
+      3. Content fetching with disambiguation filtering.
+      4. AI-based relevance validation.
+    Returns a dictionary with the best matching Wikipedia page or an error message.
+    """
+    refined_query = refine_query_with_gemini(query)
+    logging.info(f"Refined Query: '{refined_query}'")
+    
+    titles = search_wikipedia(refined_query)
+    if not titles:
+        logging.warning("Refined query returned no results, trying original query...")
+        titles = search_wikipedia(query)
+        if not titles:
+            return {"error": "No Wikipedia pages found for this query."}
+    
+    logging.info(f"Wikipedia Results: {titles}")
+    
+    candidates = []
+    for title in titles:
+        wiki_title, wiki_summary = get_wikipedia_content(title)
+        if wiki_title and wiki_summary:
+            relevance_score = is_relevant_page_gemini(query, wiki_title, wiki_summary)
+            logging.info(f"'{wiki_title}' - Relevance: {relevance_score:.2f}")
+            candidates.append((wiki_title, wiki_summary, relevance_score))
+    
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    
+    if candidates and candidates[0][2] >= 0.7:
+        best_match = candidates[0]
+        logging.info(f"Best Match: '{best_match[0]}' (score: {best_match[2]:.2f})")
+        return {"title": best_match[0], "content": best_match[1], "score": best_match[2]}
+    
+    if candidates:
+        best_available = candidates[0]
+        logging.warning(f"No highly relevant matches. Using best available: '{best_available[0]}' (score: {best_available[2]:.2f})")
+        return {"title": best_available[0], "content": best_available[1], "score": best_available[2]}
+    
+    return {"error": "No relevant Wikipedia content found."}
+
+
+### --- Example Usage --- ###
 if __name__ == "__main__":
-    main()
+    test_queries = [
+        "Who discovered gravity?",
+        "Why do we dream?",
+        "How does photosynthesis work?",
+        "What is artificial intelligence?",
+        "Why is the ocean salty?",
+        "How do vaccines work?",
+        "What causes earthquakes?",
+        "What is quantum mechanics?",
+        "Why do we have seasons?",
+        "What is consciousness?",
+        "Why do people lie?",
+        "What is the meaning of life?",
+        "Why do humans have emotions?",
+        "How does memory work?",
+        "How does the internet work?",
+        "What is machine learning?",
+        "Who invented the computer?",
+        "Why is Python popular?",
+        "What is blockchain?",
+        "Why did the Roman Empire fall?",
+        "Who was the first president of the USA?",
+        "What caused World War II?",
+        "What is the oldest civilization?",
+        "Why was the Great Wall of China built?",
+        "Who is the greatest painter of all time?",
+        "What is classical music?",
+        "How did hip-hop start?",
+        "What is Shakespeare known for?",
+        "Why are movies called 'films'?",
+        "Why do we have fingerprints?",
+        "How do birds fly?",
+        "Why do some people have allergies?",
+        "What is the function of the liver?",
+        "How does DNA work?",
+        "Why is the sky dark at night?",
+        "What is a black hole?",
+        "How was the universe formed?",
+        "Why do planets orbit the sun?",
+        "What is dark matter?"
+    ]
+    for query in test_queries:
+            logging.info(f"\nUser Query: {query}")
+            result = fetch_best_wikipedia_page(query)
+            if "error" in result:
+                logging.error(result["error"])
+                file.write(f"{query}\n")
+            else:
+                if result.get("score", 0) < 0.7:
+                    file.write(f"{query}\n")
+                logging.info(f"Title: {result['title']}")
+                logging.info(f"Relevance Score: {result.get('score', 0):.2f}")
+                logging.info(f"Content Preview: {result['content'][:500]}...\n")
+
+    logging.info(f"Failed queries saved in '{output_file}'.")
